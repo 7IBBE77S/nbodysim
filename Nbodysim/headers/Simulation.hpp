@@ -6,86 +6,47 @@
 #include <random>
 #include <numeric>
 #include <cmath>
-#include <numbers> 
+#include <numbers>
+#include <unordered_map>
+#include <atomic>
+#include <thread>
+#include <future>
+#include <execution>
 
-struct BVHNode
+extern std::atomic<float> SIMULATION_DT;
+
+
+struct SpatialGrid
 {
-    AABB bounds;
-    BVHNode *left = nullptr;
-    BVHNode *right = nullptr;
-    size_t bodyIndex = SIZE_MAX;
+    static constexpr float CELL_SIZE = 600.0f;
+    static constexpr size_t ESTIMATED_BODIES_PER_CELL = 16;
 
-    bool isLeaf() const { return left == nullptr && right == nullptr; }
-    ~BVHNode()
+    struct Cell
     {
-        delete left;
-        delete right;
+        std::vector<size_t> bodies;
+        Cell() { bodies.reserve(ESTIMATED_BODIES_PER_CELL); }
+    };
+
+    std::unordered_map<size_t, Cell> cells;
+
+    static size_t hash_position(int x, int y)
+    {
+        return ((x * 92837111) ^ (y * 689287499)) * 15485863;
     }
 };
 
-// struct alignas(16) Body {
-//     Vec2 pos;     // 8 bytes
-//     Vec2 vel;     // 8 bytes
-//     Vec2 acc;     // 8 bytes
-//     float mass;   // 4 bytes
-//     float radius; // 4 bytes
-// };
 
-// // Add before Simulation class
-// struct BodySystem {
-//     static constexpr size_t SIMD_WIDTH = 4;
-//     std::vector<Vec2> positions;    // SOA layout
-//     std::vector<Vec2> velocities;
-//     std::vector<Vec2> accelerations;
-//     std::vector<float> masses;
-//     std::vector<float> radii;
+struct SweepEntry
+{
+    float value;    // min_x or max_x of a body's AABB
+    size_t bodyIdx; // Index of the body in the bodies vector
+    bool isEnd;     // true if it's the max_x value (end of the interval) then false if min_x
 
-//     void resize(size_t n) {
-//         positions.resize(n);
-//         velocities.resize(n);
-//         accelerations.resize(n);
-//         masses.resize(n);
-//         radii.resize(n);
-//     }
-
-//     // Convert from AOS to SOA
-//     void fromBodies(const std::vector<Body>& bodies) {
-//         resize(bodies.size());
-//         for(size_t i = 0; i < bodies.size(); i++) {
-//             positions[i] = bodies[i].pos;
-//             velocities[i] = bodies[i].vel;
-//             accelerations[i] = bodies[i].acc;
-//             masses[i] = bodies[i].mass;
-//             radii[i] = bodies[i].radius;
-//         }
-//     }
-// };
-
-// inline uint32_t calculateMortonCode(Vec2 pos) {
-//     // Normalize positions to [0,1] range
-//     // Assuming reasonable bounds for your simulation
-//     const float scale = 1.0f / 1024.0f;  // Adjust based on your world size
-//     uint32_t x = static_cast<uint32_t>(pos.x * scale) & 0x0000FFFF;
-//     uint32_t y = static_cast<uint32_t>(pos.y * scale) & 0x0000FFFF;
-
-//     // Interleave bits of x and y to create Morton code
-//     x = (x | (x << 8)) & 0x00FF00FF;
-//     x = (x | (x << 4)) & 0x0F0F0F0F;
-//     x = (x | (x << 2)) & 0x33333333;
-//     x = (x | (x << 1)) & 0x55555555;
-
-//     y = (y | (y << 8)) & 0x00FF00FF;
-//     y = (y | (y << 4)) & 0x0F0F0F0F;
-//     y = (y | (y << 2)) & 0x33333333;
-//     y = (y | (y << 1)) & 0x55555555;
-
-//     return x | (y << 1);
-// }
-// // Helper function to calculate surface area of an AABB
-// inline float surfaceArea(const AABB& bounds) {
-//     Vec2 diff = bounds.max - bounds.min;
-//     return diff.x * diff.y;  // For 2D, this is actually the area
-// }
+    bool operator<(const SweepEntry &other) const
+    {
+        return value < other.value || (value == other.value && isEnd < other.isEnd);
+    }
+};
 
 class Simulation
 {
@@ -97,9 +58,9 @@ public:
     std::vector<size_t> bodyIndices;
 
     Simulation()
-        : dt(0.2f), frame(0), quadtree(1.0f, 1.0f, 16)
+        : frame(0), quadtree(1.0f, 1.0f, 16)
     {
-        size_t n = 8000;
+        size_t n = 100000;
         bodies.reserve(n);
         bodyIndices.reserve(n);
         bodies = uniform_disc(n);
@@ -107,27 +68,62 @@ public:
 
     void step()
     {
-        iterate();
+        float current_dt = SIMULATION_DT.load();
+        iterate(current_dt);
+        //  Body::batch_update_parallel(bodies, current_dt);
         collide();
         attract();
         ++frame;
+
+        
     }
 
 private:
-    void iterate()
+    void iterate(float dt)
     {
+
         for (auto &body : bodies)
         {
             body.update(dt);
         }
     }
 
+   
+    // significant bottleneck
+    //  void attract()
+    //  {
+    //      quadtree.build(bodies);
+
+    //     for (size_t i = 0; i < bodies.size(); i++)
+    //     {
+    //         bodies[i].acc = quadtree.acc(bodies[i].pos, bodies);
+    //     }
+    // }
+
     void attract()
     {
         quadtree.build(bodies);
-        for (auto &body : bodies)
+
+        const unsigned int num_threads = std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4;
+        std::vector<std::future<void>> futures;
+
+        size_t chunk_size = bodies.size() / num_threads;
+
+        for (unsigned int t = 0; t < num_threads; ++t)
         {
-            body.acc = quadtree.acc(body.pos);
+            size_t start = t * chunk_size;
+            size_t end = (t == num_threads - 1) ? bodies.size() : start + chunk_size;
+
+            futures.emplace_back(std::async(std::launch::async, [&, start, end]()
+                                            {
+            for (size_t i = start; i < end; ++i) {
+                bodies[i].acc = quadtree.acc(bodies[i].pos, bodies); 
+            } }));
+        }
+
+        for (auto &fut : futures)
+        {
+            fut.get();
         }
     }
 
@@ -136,87 +132,79 @@ private:
         if (bodies.empty())
             return;
 
-        bodyIndices.resize(bodies.size());
-        std::iota(bodyIndices.begin(), bodyIndices.end(), 0);
+        SpatialGrid grid;
+        std::vector<std::pair<size_t, size_t>> broadPhasePairs;
 
-        BVHNode *root = buildBVH(bodyIndices, 0, bodies.size());
-        collideBVH(root, root);
-        delete root;
-    }
-
-    AABB computeBodyAABB(const Body &body)
-    {
-        Vec2 r(body.radius, body.radius);
-        return {body.pos - r, body.pos + r};
-    }
-
-    BVHNode *buildBVH(std::vector<size_t> &indices, size_t start, size_t end)
-    {
-        if (start >= end)
-            return nullptr;
-
-        BVHNode *node = new BVHNode();
-
-        if (end - start == 1)
+        for (size_t i = 0; i < bodies.size(); i++)
         {
-            node->bodyIndex = indices[start];
-            node->bounds = computeBodyAABB(bodies[node->bodyIndex]);
-            return node;
-        }
+            const Body &body = bodies[i];
+            Vec2 r(body.radius, body.radius);
+            AABB bounds = {body.pos - r, body.pos + r};
 
-        AABB bounds = computeBodyAABB(bodies[indices[start]]);
-        for (size_t i = start + 1; i < end; ++i)
-        {
-            bounds = AABB::combine(bounds, computeBodyAABB(bodies[indices[i]]));
-        }
-        node->bounds = bounds;
+            int minX = static_cast<int>(bounds.min.x / SpatialGrid::CELL_SIZE);
+            int maxX = static_cast<int>(bounds.max.x / SpatialGrid::CELL_SIZE);
+            int minY = static_cast<int>(bounds.min.y / SpatialGrid::CELL_SIZE);
+            int maxY = static_cast<int>(bounds.max.y / SpatialGrid::CELL_SIZE);
 
-        size_t mid = start + (end - start) / 2;
-        bool splitX = (bounds.max.x - bounds.min.x) > (bounds.max.y - bounds.min.y);
-
-        std::sort(indices.begin() + start, indices.begin() + end,
-                  [&](size_t a, size_t b)
-                  {
-                      return splitX ? bodies[a].pos.x < bodies[b].pos.x : bodies[a].pos.y < bodies[b].pos.y;
-                  });
-
-        node->left = buildBVH(indices, start, mid);
-        node->right = buildBVH(indices, mid, end);
-        return node;
-    }
-
-    void collideBVH(BVHNode *a, BVHNode *b)
-    {
-        if (!a || !b || !a->bounds.overlaps(b->bounds))
-            return;
-
-        if (a->isLeaf() && b->isLeaf())
-        {
-            if (a->bodyIndex != b->bodyIndex)
+            for (int y = minY; y <= maxY; y++)
             {
-                resolve(a->bodyIndex, b->bodyIndex);
+                for (int x = minX; x <= maxX; x++)
+                {
+                    size_t hash = SpatialGrid::hash_position(x, y);
+                    grid.cells[hash].bodies.push_back(i);
+                }
             }
-            return;
         }
 
-        if (a->isLeaf())
+        for (const auto &[hash, cell] : grid.cells)
         {
-            collideBVH(a, b->left);
-            collideBVH(a, b->right);
+            if (cell.bodies.size() > 1)
+            {
+                std::vector<SweepEntry> sweepList;
+                sweepList.reserve(cell.bodies.size() * 2);
+
+                for (size_t idx : cell.bodies)
+                {
+                    const Body &body = bodies[idx];
+                    Vec2 r(body.radius, body.radius);
+                    float minX = body.pos.x - r.x;
+                    float maxX = body.pos.x + r.x;
+
+                    sweepList.push_back({minX, idx, false});
+                    sweepList.push_back({maxX, idx, true});
+                }
+
+                std::sort(sweepList.begin(), sweepList.end());
+
+                std::vector<size_t> active;
+
+                for (const auto &entry : sweepList)
+                {
+                    if (!entry.isEnd)
+                    {
+                        for (size_t activeIdx : active)
+                        {
+                            broadPhasePairs.emplace_back(activeIdx, entry.bodyIdx);
+                        }
+                        active.push_back(entry.bodyIdx);
+                    }
+                    else
+                    {
+                        active.erase(std::remove(active.begin(), active.end(),
+                                                 entry.bodyIdx),
+                                     active.end());
+                    }
+                }
+            }
         }
-        else if (b->isLeaf())
+
+
+        for (const auto &[i, j] : broadPhasePairs)
         {
-            collideBVH(a->left, b);
-            collideBVH(a->right, b);
-        }
-        else
-        {
-            collideBVH(a->left, b->left);
-            collideBVH(a->left, b->right);
-            collideBVH(a->right, b->left);
-            collideBVH(a->right, b->right);
+            resolve(i, j);
         }
     }
+ 
 
     void resolve(size_t i, size_t j)
     {
@@ -272,13 +260,12 @@ private:
         bodies[i].pos += v1 * t;
         bodies[j].pos += v2 * t;
     }
-
     std::vector<Body> uniform_disc(size_t n)
     {
         std::mt19937 rng(0);
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
-        float inner_radius = 100.0f;
+        float inner_radius = 200.0f;
         float outer_radius = std::sqrt(static_cast<float>(n)) * 300.7f;
 
         std::vector<Body> bodies;
@@ -289,14 +276,14 @@ private:
 
         // const float TAU = 6.28318530718f; // Tau constant
         // const float TAU = (std::atan(1)*4)*2.0f;
-        constexpr double TAU = std::numbers::pi * 2;
+        // constexpr double TAU = std::numbers::pi * 4;
 
         // mass ranges and their probabilities here
         struct MassRange
         {
             float min_mass;
             float max_mass;
-            float probability; 
+            float probability;
         };
 
         std::vector<MassRange> massRanges = {
@@ -324,17 +311,25 @@ private:
             cumulative += range.probability;
             cumulativeProbs.push_back(cumulative);
         }
+        // lorenz attractor parameters
+        const float sigma = 10.0f;
+        const float rho = 28.0f;
+        const float beta = 8.0f / 3.0f;
+
+        float x = 0.1f;
+        float y = 0.0f;
+        float z = 0.0f;
 
         while (bodies.size() < n)
         {
-            double a = static_cast<double>(dist(rng)) * TAU;
+            // double a = static_cast<double>(dist(rng)) * TAU;
+            // double k = 7.0; // adjusting k changes the number of loops and other fun things
+
             // normal
             // float sin_a = std::sin(a);
             // float cos_a = std::cos(a);
 
-
             /*chaos and cool stuff (m and outer radius will need to be tweaked)*/
-            // double k = 6.0; // adjusting k changes the number of loops
             // float sin_a = std::sin(k * a);
             // float cos_a = std::sin(k * a) * std::cos(a);
 
@@ -346,32 +341,79 @@ private:
             // float sin_a = static_cast<double>(std::sqrt(2.0f)) * std::sin(a) * std::cos(a) / static_cast<double>(denom);
             // float cos_a = static_cast<double>(std::sqrt(2.0f)) * std::cos(a) / static_cast<double>(denom);
 
-            double k = 7.0; // Number of petals
+            // double k = 7.0; // Number of petals
             // float o = outer_radius * sqrt(dist(rng));
             // float sin_a  = static_cast<double>(o) * std::cos(k * a) * std::cos(a);
             // float cos_a = static_cast<double>(o) * std::cos(k * a) * std::sin(a);
 
-            // float sin_a = std::sin(a) / std::cos(a); // the grid / spiral
-            // float cos_a = std::cos(a) / std::tan(a);
+            // float sin_a = std::sin(a * k) / std::cos(a); // the grid / spiral
+            // float cos_a = std::cos(a * k) / std::tan(a);
 
+            // Heart shape parametric equations <3
+            // float f = static_cast<float>(a) * 2.0f; // Force float precision
+            // float scale = 1.2f;
+
+            // // Break down calculations for clarity and precision
+            // float sin_cube = std::powf(std::sinf(f), 3.0f);
+            // float sin_term = 16.0f * sin_cube;
+
+            // // Cosine terms with decreasing amplitudes
+            // float cos_term1 = 13.0f * std::cosf(f);
+            // float cos_term2 = 5.0f * std::cosf(2.0f * f);
+            // float cos_term3 = 2.0f * std::cosf(3.0f * f);
+            // float cos_term4 = std::cosf(4.0f * f);
+
+            // // Final parametric equations
+            // float sin_a = scale * sin_term;
+            // float cos_a = scale * (cos_term1 - cos_term2 - cos_term3 - cos_term4);
+
+            // Heart shape parametric equations - vertical orientation
+            // float f = static_cast<float>(a) * 2.0f;
+            // float scale = 1.2f;
+
+            // // Use powf and single-precision trig functions consistently
+            // float sin_v = std::sinf(f);
+            // float sin_cube = sin_v * sin_v * sin_v;  // Instead of powf
+            // float sin_term = 16.0f * sin_cube;
+
+            // // Cosine terms using single-precision
+            // float cos_term1 = 13.0f * std::cosf(f);
+            // float cos_term2 = 5.0f * std::cosf(2.0f * f);
+            // float cos_term3 = 2.0f * std::cosf(3.0f * f);
+            // float cos_term4 = std::cosf(4.0f * f);
+
+            // // Final parametric equations
+            // float cos_a = scale * sin_term;  // x coordinate
+            // float sin_a = -scale * (cos_term1 - cos_term2 - cos_term3 - cos_term4);  // y coordinate
             // flip flop
-            // float sin_a = std::sin(a) * std::cos(a * static_cast<double>(2.0f)); // double frequency spiral
-            // float cos_a = std::cos(a) * std::sin(a * static_cast<double>(2.0f));
+            // float sin_a = std::sin(k*a) * std::cos(a * static_cast<double>(2.0f)); // double frequency spiral
+            // float cos_a = std::cos(k*a) * std::sin(a * static_cast<double>(2.0f));
 
             // // // rose Lissajous curve
             // float sin_a = std::sin(a * 5.0) * std::cos(a); // 5 petal flower
             // float cos_a = std::cos(a * 5.0) * std::sin(a);
 
             // // box...
-            // float sin_a = std::tanh(std::sin(a * 2.0));
-            // float cos_a = std::tanh(std::cos(a * 2.0));
+            // float sin_a = std::tanh(std::sin(k* a * 2.0));
+            // float cos_a = std::tanh(std::cos(k* a * 2.0));
 
             // // star burst
             // float sin_a = std::sin(k * a) * std::pow(std::cos(a * 3.0), k);
             // float cos_a = std::cos(k * a) * std::pow(std::sin(a * 3.0), k);
-            //using k
-            float sin_a = std::sin(k * a) * std::pow(std::cos(a * 3.0), k);
-            float cos_a = std::cos(k * a) * std::pow(std::sin(a * 3.0), k);
+            // using k
+            // float sin_a = std::sin(k * a) * std::pow(std::cos(a * 3.0), k);
+            // float cos_a = std::cos(k * a) * std::pow(std::sin(a * 3.0), k);
+
+            // The mural
+            // Create oscillating patterns using frame count
+            // float phase = std::fmod(frame * 0.01f, TAU);  // Smooth oscillation over time
+            // float blend = (std::asinh(phase) + 1.0f) * 0.5f;  // Oscillates between 0 and 1
+
+            // float sin_a = blend * (std::tanf(k * a) * std::powf(std::cosf(a * 3.0), k)) +
+            //               (1.0f + blend) * (std::tanhf(k * a) * std::powf(std::sinf(a * 3.0), k));
+
+            // float cos_a = blend * (std::tanf(k * a) * std::powf(std::sinf(a * 3.0), k)) +
+            //               (1.0f + blend) * (std::tanhf(k * a) * std::powf(std::cosf(a * 3.0), k));
 
             // golden
             // float sin_a = std::sin(a) * std::pow(std::cosh(a * 3.0), 2);
@@ -379,25 +421,63 @@ private:
 
             // // ?
             // float phase = std::fmod(frame * 0.01f, TAU);
-            // float sin_a = std::tan(a + static_cast<double>(phase)) / std::cos(a / 0.5 + static_cast<double>(phase));
-            // float cos_a = std::tanh(a + static_cast<double>(phase)) / std::sin(a / 0.5 + static_cast<double>(phase));
+            // float sin_a = std::tan(a + static_cast<double>(phase)) / std::cos(k*a / 0.5 + static_cast<double>(phase));
+            // float cos_a = std::tanh(a + static_cast<double>(phase)) / std::sin(k*a / 0.5 + static_cast<double>(phase));
 
             // float sin_a = std::cos(a); //cool
             // float cos_a = std::tan(a);
 
-            // float sin_a = std::tan(a); // interesting
-            // float cos_a = std::cosh(a);
+            // double b = static_cast<double>(dist(rng)) * TAU; // Assuming y is also a random variable
 
-            // float sin_a = std::cosh(a); // interesting
-            // float cos_a = std::tan(a);
+            // // // Equation sin(x^2 + y^2) = cos(x)
+            // float sin_a = std::sin(a * a + b * b); // sin(x^2 + y^2)
+            // float cos_a = std::cos(a);             // cos(x)
 
-            float t = inner_radius / outer_radius;
-            float r = dist(rng) * (1.0f - t * t) + t * t;
-            Vec2 pos(cos_a, sin_a);
-            pos *= outer_radius * std::sqrt(r);
-            Vec2 vel(sin_a, -cos_a);
+            // // Combine the results
+            // float result = sin_a - cos_a; // T
 
-            // will select a mass range based the abobe probabilities
+            const float dt = 0.01f; // Integration timestep for Lorenz
+
+            // Lorenz equations
+            float dx = sigma * (y - x);
+            float dy = x * (rho - z) - y;
+            float dz = x * y - beta * z;
+
+            x += dx * dt;
+            y += dy * dt;
+            z += dz * dt;
+
+            float scale = outer_radius / 10.0f; 
+            Vec2 pos(x * scale, y * scale);
+
+            Vec2 vel(-pos.y, pos.x);
+            vel.normalize();
+
+            // lemniscate of Bernoulli
+            // float sin_a = std::cos(a) / (1.0 + std::sin(a) * std::sin(a));
+            // float cos_a = std::cos(a) * std::sin(a) / (1.0 + std::sin(a) * std::sin(a));
+
+            // fermat's spiral
+            // float c = 0.5f; // controls spacing
+            // float r1 = c * std::sqrtf(a);
+            // float sin_a = r1 * std::sinf(a);
+            // float cos_a = r1 * std::cosf(a);
+            // hypocycloid (4-cusped) (eye)
+            // float k = 4.0f;
+            // float sin_a = (k - 1.0f) * std::cosf(static_cast<float>(a)) + std::cosf((k - 1.0f) * static_cast<float>(a));
+            // float cos_a = (k - 1.0f) * std::sinf(static_cast<float>(a)) - std::sinf((k - 1.0f) * static_cast<float>(a));
+            //
+            // float k = 5.0f;
+            // float sin_a = (k + 1.0f) * std::cosf(static_cast<float>(a)) + std::cosf((k + 1.0f) * static_cast<float>(a));
+            // float cos_a = (k + 1.0f) * std::sinf(static_cast<float>(a)) - std::sinf((k + 1.0f) * static_cast<float>(a));
+
+            // float t = inner_radius / outer_radius;
+            // float r = dist(rng) * (1.0f - t * t) + t * t;
+            // Vec2 pos(cos_a, sin_a); // Use x and y for position
+            // pos *= outer_radius * std::sqrt(r);
+            // Vec2 vel(sin_a, -cos_a);
+
+            // will select a mass range based the above probabilities
             float randProb = dist(rng);
             size_t selectedRangeIndex = 0;
             for (size_t i = 0; i < cumulativeProbs.size(); ++i)
@@ -410,10 +490,9 @@ private:
             }
             const MassRange &selectedRange = massRanges[selectedRangeIndex];
 
-            // assigns the mass within the selected range
             float mass = dist(rng) * (selectedRange.max_mass - selectedRange.min_mass) + selectedRange.min_mass;
 
-            float radius = std::cbrt(mass); // and adjust radius based on mass
+            float radius = std::cbrt(mass); 
 
             bodies.push_back(Body(pos, vel, mass, radius));
         }

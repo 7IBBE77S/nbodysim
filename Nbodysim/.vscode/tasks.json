@@ -24,7 +24,15 @@
                 "/opt/homebrew/include",
                 "-L",
                 "/opt/homebrew/lib",
-                 "-lraylib"
+                "-lraylib",
+                // "-DRAYGUI_IMPLEMENTATION",
+                // "-lraygui",
+                "-fexperimental-library",
+                "-O3",
+                // "-ffast-math", 
+                // "-march=armv8-a+simd",
+                
+
             ],
             "group": {
                 "kind": "build",

@@ -75,7 +75,13 @@
     "system_error": "cpp",
     "span": "cpp",
     "text_encoding": "cpp",
-    "chrono": "cpp"
+    "chrono": "cpp",
+    "clocale": "cpp",
+    "condition_variable": "cpp",
+    "thread": "cpp",
+    "stack": "cpp",
+    "future": "cpp",
+    "unordered_set": "cpp"
   },
   "C_Cpp_Runner.msvcBatchPath": "",
   "C_Cpp_Runner.cCompilerPath": "clang",
@@ -133,5 +139,6 @@
   "C_Cpp_Runner.useLeakSanitizer": false,
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
-  "C_Cpp_Runner.msvcSecureNoWarnings": false
+  "C_Cpp_Runner.msvcSecureNoWarnings": false,
+  "C_Cpp.errorSquiggles": "disabled"
 }

@@ -11,22 +11,35 @@ struct Quad {
 
     Quad() = default;
     Quad(Vec2 center, float size) : center(center), size(size) {}
+    Quad(const Quad& other) : center(other.center), size(other.size) {}
+    
+    Quad(Quad&& other) noexcept : center(std::move(other.center)), size(other.size) {}
+
+       Quad& operator=(const Quad& other) {
+        center = other.center;
+        size = other.size;
+        return *this;
+    }
+
+    Quad& operator=(Quad&& other) noexcept {
+        center = std::move(other.center);
+        size = other.size;
+        return *this;
+    }
+
 
     static Quad new_containing(const std::vector<Body>& bodies) {
-        float min_x = std::numeric_limits<float>::max();
-        float min_y = std::numeric_limits<float>::max();
-        float max_x = std::numeric_limits<float>::lowest();
-        float max_y = std::numeric_limits<float>::lowest();
+        Vec2 min_bounds = Vec2::broadcast(std::numeric_limits<float>::max());
+        Vec2 max_bounds = Vec2::broadcast(std::numeric_limits<float>::lowest());
 
         for (const auto& body : bodies) {
-            min_x = std::min(min_x, body.pos.x);
-            min_y = std::min(min_y, body.pos.y);
-            max_x = std::max(max_x, body.pos.x);
-            max_y = std::max(max_y, body.pos.y);
+            min_bounds = min_bounds.min_by_component(body.pos);
+            max_bounds = max_bounds.max_by_component(body.pos);
         }
 
-        Vec2 center((min_x + max_x) * 0.5f, (min_y + max_y) * 0.5f);
-        float size = std::max(max_x - min_x, max_y - min_y);
+        Vec2 center = (min_bounds + max_bounds) * 0.5f;
+        Vec2 size_vec = max_bounds - min_bounds;
+        float size = size_vec.component_max();
 
         return Quad(center, size);
     }
@@ -37,9 +50,9 @@ struct Quad {
 
     Quad into_quadrant(size_t quadrant) const {
         float new_size = size * 0.5f;
-        Vec2 new_center = center;
-        new_center.x += ((quadrant & 1) - 0.5f) * new_size;
-        new_center.y += ((quadrant >> 1) - 0.5f) * new_size;
+        Vec2 offset = Vec2::unit_x() * ((quadrant & 1) - 0.5f) + 
+                     Vec2::unit_y() * ((quadrant >> 1) - 0.5f);
+        Vec2 new_center = center + offset * new_size;
         return Quad(new_center, new_size);
     }
 

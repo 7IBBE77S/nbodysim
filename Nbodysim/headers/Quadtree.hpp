@@ -1,23 +1,28 @@
 #pragma once
 #include "Node.hpp"
-#include "Partition.hpp"
+#include "Quad.hpp"
 #include <vector>
-
+#include <algorithm>
+#include <mutex>
 class Quadtree
 {
 public:
-     static const size_t ROOT = 0;
+    static inline const size_t ROOT = 0;
     float t_sq;
     float e_sq;
     size_t leaf_capacity;
     std::vector<Node> nodes;
     std::vector<size_t> parents;
+    std::mutex tree_mutex;
 
-    Quadtree(float theta, float epsilon, size_t leaf_capacity = 16)
-        : t_sq(theta * theta), e_sq(epsilon * epsilon), leaf_capacity(leaf_capacity) 
+    Quadtree(float theta, float epsilon, size_t num_bodies, size_t leaf_capacity = 16)
+        : t_sq(theta * theta), e_sq(epsilon * epsilon), leaf_capacity(leaf_capacity)
     {
-        nodes.reserve(1000);
-        parents.reserve(1000);
+        // nodes.reserve(10000); // pre-allocate for better performance
+        // parents.reserve(1000);
+        size_t estimated_nodes = num_bodies * 4 / 3; // perfect quad tree node count
+        nodes.reserve(estimated_nodes);
+        parents.reserve(num_bodies / leaf_capacity);
     }
 
     void clear(Quad quad)
@@ -29,33 +34,48 @@ public:
 
     void insert(Vec2 pos, float mass)
     {
+        std::lock_guard<std::mutex> lock(tree_mutex);
         size_t node = ROOT;
+
         while (nodes[node].is_branch())
         {
-            size_t quadrant = nodes[node].quad.find_quadrant(pos);
+            size_t quadrant = nodes[node].data.quad.find_quadrant(pos); 
             node = nodes[node].children + quadrant;
         }
 
         if (nodes[node].is_empty())
         {
-            nodes[node].pos = pos;
-            nodes[node].mass = mass;
+            nodes[node].data.pos = pos;
+            nodes[node].data.mass = mass;
             return;
         }
 
-        Vec2 p = nodes[node].pos;
-        float m = nodes[node].mass;
-        if (pos == p)
+        Vec2 existing_pos = nodes[node].data.pos;
+        float existing_mass = nodes[node].data.mass;
+
+        if (pos == existing_pos)
         {
-            nodes[node].mass += mass;
+            nodes[node].data.mass += mass;
             return;
         }
 
         while (true)
         {
-            size_t children = subdivide(node);
-            size_t q1 = nodes[node].quad.find_quadrant(p);
-            size_t q2 = nodes[node].quad.find_quadrant(pos);
+            size_t children = nodes.size();
+            nodes[node].children = children;
+            parents.push_back(node);
+
+            auto quads = nodes[node].data.quad.subdivide(); 
+            for (size_t i = 0; i < 4; ++i)
+            {
+                nodes.emplace_back(Node(
+                    (i < 3) ? children + i + 1 : nodes[node].next,
+                    quads[i],
+                    nodes[node].depth + 1
+                    ));
+            }
+            size_t q1 = nodes[node].data.quad.find_quadrant(existing_pos);
+            size_t q2 = nodes[node].data.quad.find_quadrant(pos);
 
             if (q1 == q2)
             {
@@ -63,141 +83,154 @@ public:
             }
             else
             {
-                size_t n1 = children + q1;
-                size_t n2 = children + q2;
-                nodes[n1].pos = p;
-                nodes[n1].mass = m;
-                nodes[n2].pos = pos;
-                nodes[n2].mass = mass;
+                nodes[children + q1].data.pos = existing_pos;
+                nodes[children + q1].data.mass = existing_mass;
+                nodes[children + q2].data.pos = pos;
+                nodes[children + q2].data.mass = mass;
                 return;
             }
         }
     }
 
-    // Vec2 acc(Vec2 pos) const {
-    //     Vec2 acc = Vec2::zero();
-    //     size_t node = ROOT;
-
-    //     while (node < nodes.size()) {
-    //         if (node != ROOT && nodes[node].is_empty()) {
-    //             node = nodes[node].next;
-    //             continue;
-    //         }
-
-    //         Vec2 d = nodes[node].pos - pos;
-    //         float d_sq = d.mag_sq();
-
-    //         if (node != ROOT && (nodes[node].quad.size * nodes[node].quad.size < d_sq * t_sq)) {
-    //             if (d_sq > 0) {
-    //                 float force = nodes[node].mass / (d_sq * std::sqrt(d_sq + e_sq));
-    //                 acc += d * force;
-    //             }
-    //             node = nodes[node].next;
-    //         } else if (nodes[node].is_leaf()) {
-    //             if (d_sq > 0) {
-    //                 float force = nodes[node].mass / (d_sq * std::sqrt(d_sq + e_sq));
-    //                 acc += d * force;
-    //             }
-    //             node = nodes[node].next;
-    //         } else {
-    //             node = nodes[node].children;
-    //         }
-    //     }
-    //     return acc;
+    // "Evil Fast" inverse square root using the "Quake III" algorithm
+    // inline float fast_inv_sqrt(float x) const
+    // {
+    //     float half_x = 0.5f * x;
+    //     int i = *(int *)&x;           // Interpret float bits as int
+    //     i = 0x5f3759df - (i >> 1);    // Initial approximation
+    //     x = *(float *)&i;             // Interpret int bits back as float
+    //     x *= 1.5f - (half_x * x * x); // Newton-Raphson refinement
+    //     return x;
     // }
 
-
-    Vec2 acc(Vec2 pos) const
+    inline constexpr float fast_inv_sqrt(float number) const noexcept
     {
-        Vec2 acc = Vec2::zero();
-        size_t node = ROOT;
-
-        while (true)
-        {
-            const Node &n = nodes[node];
-            Vec2 d = n.pos - pos;
-            float d_sq = d.mag_sq() + e_sq;
-
-            if (n.is_leaf() || n.quad.size * n.quad.size < d_sq * t_sq)
-            {
-                if (d_sq > 0)
-                {
-                    float force = n.mass / (d_sq * std::sqrt(d_sq));
-                    acc += d * force;
-                }
-
-                if (n.next == 0)
-                    break;
-                node = n.next;
-            }
-            else
-            {
-                node = n.children;
-            }
-        }
-
-        return acc;
+        const auto y = std::bit_cast<float>(
+            0x5f3759df - (std::bit_cast<uint32_t>(number) >> 1));
+        return y * (1.5f - (number * 0.5f * y * y));
     }
+
+Vec2 acc(const Vec2& pos, const std::vector<Body>& bodies) const {
+    Vec2 acc = Vec2::zero();
+    size_t node = ROOT;
+
+    while(true) {
+        const Node& n = nodes[node];
+        Vec2 d = n.data.pos - pos;
+        float d_sq = d.mag_sq();
+
+        if (n.data.quad.size * n.data.quad.size < d_sq * t_sq) {
+            // far enough... use approximation
+            if (d_sq > 0) {
+                float inv_dist = fast_inv_sqrt(d_sq + e_sq);
+                float inv_dist_cubed = inv_dist * inv_dist * inv_dist;
+                acc += d * (n.data.mass * inv_dist_cubed);
+            }
+
+            if (n.next == 0) break;
+            node = n.next;
+        }
+        else if (n.is_leaf()) {
+            for (size_t i = n.bodies.start; i < n.bodies.end; ++i) {
+                const Body& body = bodies[i];
+                Vec2 r = body.pos - pos;
+                float r_sq = r.mag_sq();
+
+                if (r_sq > 0) {
+                    float inv_dist = fast_inv_sqrt(r_sq + e_sq);
+                    float inv_dist_cubed = inv_dist * inv_dist * inv_dist;
+                    acc += r * (body.mass * inv_dist_cubed);
+                }
+            }
+
+            if (n.next == 0) break;
+            node = n.next;
+        }
+        else {
+            node = n.children;
+        }
+    }
+
+    return acc;
+}
 
     void build(const std::vector<Body> &bodies)
     {
-        nodes.reserve(bodies.size() * 2);
+        size_t estimated_nodes = bodies.size() * 2;
+        nodes.reserve(estimated_nodes);
         parents.reserve(bodies.size());
-        clear(Quad::new_containing(bodies));
 
-        for (size_t i = 0; i < bodies.size(); i++)
+        clear(Quad::new_containing(bodies));
+        for (const auto &body : bodies)
         {
-            insert(bodies[i].pos, bodies[i].mass);
+            insert(body.pos, body.mass);
         }
+
         propagate();
     }
 
-    size_t subdivide(size_t node) {  
-        parents.push_back(node);
-        size_t children = nodes.size();
-        nodes[node].children = children;
+    void subdivide(size_t node_index, std::vector<Body> &bodies)
+    {
+        const Vec2 &center = nodes[node_index].data.quad.center;
+        std::array<size_t, 5> split;
+        split[0] = nodes[node_index].bodies.start;
+        split[4] = nodes[node_index].bodies.end;
 
-        std::array<size_t, 4> nexts = {
-            children + 1,
-            children + 2,
-            children + 3,
-            nodes[node].next
+        auto predicate_y = [&center](const Body &body)
+        {
+            return body.pos[1] < center[1]; 
+        };
+        split[2] = partition_in_place(bodies, split[0], split[4], predicate_y);
+
+        auto predicate_x = [&center](const Body &body)
+        {
+            return body.pos[0] < center[0];
         };
 
-        std::array<Quad, 4> quads = nodes[node].quad.subdivide();
-        for (size_t i = 0; i < 4; ++i) {
-            nodes.push_back(Node(nexts[i], quads[i]));
-        }
+        split[1] = partition_in_place(bodies, split[0], split[2], predicate_x);
+        split[3] = partition_in_place(bodies, split[2], split[4], predicate_x);
 
-        return children;
+        parents.push_back(node_index);
+        size_t children_start = nodes.size();
+        nodes[node_index].children = children_start;
+
+        auto quads = nodes[node_index].data.quad.subdivide();
+        for (size_t i = 0; i < 4; ++i)
+        {
+            nodes.emplace_back(Node(
+                (i < 3) ? children_start + i + 1 : nodes[node_index].next,
+                quads[i]));
+            nodes.back().bodies.start = split[i];
+            nodes.back().bodies.end = split[i + 1];
+        }
     }
 
+
 private:
-    //UNUSED
-    std::array<size_t, 4> partition_bodies(std::vector<Body> &bodies, size_t start, size_t end, const Quad &quad)
+    template <typename Pred>
+    static size_t
+    partition_in_place(std::vector<Body> &bodies, size_t start, size_t end, Pred pred)
     {
-        std::array<size_t, 4> indices;
+        if (start >= end)
+            return start;
 
-        size_t mid_x = Partition<Body>::partition(bodies, start, end,
-                                                  [&quad](const Body &body)
-                                                  {
-                                                      return body.pos.x < quad.center.x;
-                                                  });
+        size_t left = start;
+        size_t right = end - 1;
 
-        indices[0] = start;
-        indices[1] = Partition<Body>::partition(bodies, start, mid_x,
-                                                [&quad](const Body &body)
-                                                {
-                                                    return body.pos.y < quad.center.y;
-                                                });
-        indices[2] = Partition<Body>::partition(bodies, mid_x, end,
-                                                [&quad](const Body &body)
-                                                {
-                                                    return body.pos.y < quad.center.y;
-                                                });
-        indices[3] = end;
+        while (true)
+        {
+            while (left <= right && pred(bodies[left]))
+                left++;
+            while (left < right && !pred(bodies[right]))
+                right--;
 
-        return indices;
+            if (left >= right)
+                return left;
+
+            std::swap(bodies[left], bodies[right]);
+            left++;
+            right--;
+        }
     }
 
     void propagate()
@@ -205,24 +238,23 @@ private:
         for (auto it = parents.rbegin(); it != parents.rend(); ++it)
         {
             size_t node = *it;
-            Vec2 com = Vec2::zero();
-            float total_mass = 0.0f;
+            size_t child = nodes[node].children;
 
-            for (size_t i = 0; i < 4; i++)
+            nodes[node].data.pos = Vec2::zero();
+            nodes[node].data.mass = 0;
+
+            for (size_t i = 0; i < 4; ++i)
             {
-                size_t child = nodes[node].children + i;
-                if (nodes[child].mass > 0)
-                {
-                    com += nodes[child].pos * nodes[child].mass;
-                    total_mass += nodes[child].mass;
-                }
+                const Node &child_node = nodes[child + i];
+                nodes[node].data.pos += child_node.data.pos * child_node.data.mass;
+                nodes[node].data.mass += child_node.data.mass;
             }
 
-            if (total_mass > 0)
+            if (nodes[node].data.mass > 0)
             {
-                nodes[node].pos = com / total_mass;
-                nodes[node].mass = total_mass;
+                nodes[node].data.pos /= nodes[node].data.mass;
             }
         }
     }
+
 };

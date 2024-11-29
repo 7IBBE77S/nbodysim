@@ -1,5 +1,5 @@
 ---
 triple:          'arm64-apple-darwin'
-binary-path:     '/Users/7ibbe77s/Desktop/Nbodysim/bin/main'
+binary-path:     '/Users/7ibbe77s/Desktop/nbodysim/Nbodysim/bin/main'
 relocations:     []
 ...
