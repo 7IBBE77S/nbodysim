@@ -375,24 +375,22 @@ void drawConnections(const std::vector<Body> &bodies, float scale, Vector2 cente
 //             // Add point if leaf node CRITICAL BOTTLENECK
 //             if (!current->is_branch())
 //             {
-//                 visiblePoints.push_back(worldToScreen(current->data.pos, scale, center)); //accounts for 18% performance loss
+//                 visiblePoints.push_back(worldToScreen(current->data.pos, scale, center));
 //             }
 //         // }
 
-//         // Always check children - they might be visible even if parent isn't CRITICAL BOTTLENECK
 //         if (current->is_branch())
 //         {
 //             for (int i = 0; i < 4; i++)
 //             {
 //                 if (current->children + i < nodes.size())
 //                 {
-//                     nodePool.push_back(&nodes[current->children + i]); //accounts for 13.3% performance loss
+//                     nodePool.push_back(&nodes[current->children + i]); 
 //                 }
 //             }
 //         }
 //     }
 
-//     // Batch render visible elements only
 //     for (const auto &quad : visibleQuads)
 //     {
 //         DrawRectangleLinesEx(quad, 1, {100, 100, 100, 100});
@@ -721,9 +719,9 @@ int main()
                             centralMass = &body;
                         }
 
-                        if (isInScreenBounds(body.pos, scale, center)) // 2.66s of performance loss
+                        if (isInScreenBounds(body.pos, scale, center)) 
                         {
-                            visibleBodies.push_back(&body); // 2.52s of performance loss
+                            visibleBodies.push_back(&body);
                         }
                     }
 

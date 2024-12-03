@@ -427,7 +427,7 @@ private:
             // float sin_a = std::cos(a); //cool
             // float cos_a = std::tan(a);
 
-            // double b = static_cast<double>(dist(rng)) * TAU; // Assuming y is also a random variable
+            // double b = static_cast<double>(dist(rng)) * TAU;
 
             // // // Equation sin(x^2 + y^2) = cos(x)
             // float sin_a = std::sin(a * a + b * b); // sin(x^2 + y^2)

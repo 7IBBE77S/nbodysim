@@ -23,7 +23,7 @@ struct alignas(16) Vec2
     constexpr Vec2() noexcept = default;
     // constexpr Vec2(float x, float y) noexcept : x(x), y(y) {}
     constexpr Vec2(float x_, float y_) noexcept : x(x_), y(y_) {}
-    inline constexpr Vec2(const Vec2 &other) noexcept : x(other.x), y(other.y) {} // 742.00ms of performance loss
+    inline constexpr Vec2(const Vec2 &other) noexcept : x(other.x), y(other.y) {}
 
     constexpr Vec2(Vec2 &&other) noexcept : x(other.x), y(other.y) {}
 
