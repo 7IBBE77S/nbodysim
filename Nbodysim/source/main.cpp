@@ -8,9 +8,8 @@
  *  Description:    _
  ***********************************************************/
 
-
-
-#include <raylib.h>
+#include "raylib.h"
+#include "rlgl.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wall"
 #pragma clang diagnostic ignored "-Weverything"
@@ -33,6 +32,7 @@
 std::atomic<bool> PAUSED{false};
 std::atomic<bool> PERFORMANCE_MODE{false};
 std::atomic<bool> SHOW_CONNECTIONS{false};
+std::atomic<bool> SHOW_QUADTREE{false};
 std::atomic<bool> SHOW_BODIES{true};
 
 std::mutex UPDATE_LOCK;
@@ -47,8 +47,8 @@ bool frameRendered = false;
 
 constexpr int MAX_BODIES_PER_CELL = 16;
 
-constexpr float MAX_DISTANCE = 2000.0f; 
-constexpr int MAX_CONNECTIONS = 30;    
+constexpr float MAX_DISTANCE = 1000.0f;
+constexpr int MAX_CONNECTIONS = 5;
 
 constexpr float SLIDER_MIN_DT = 0.001f;
 constexpr float SLIDER_MAX_DT = 0.1f;
@@ -59,9 +59,8 @@ struct GridCell
     int count = 0;
 };
 
-bool firstFrame = true; 
+bool firstFrame = true;
 std::unordered_map<uint64_t, GridCell> spatialGrid;
-
 
 constexpr float MAX_GRID_DISTANCE = MAX_DISTANCE * 100.0f;
 
@@ -77,7 +76,6 @@ uint64_t getGridKey(const Vec2 &pos)
 
     return (static_cast<uint64_t>(gridX) << 32) | static_cast<uint64_t>(gridY);
 }
-
 
 struct SystemMetrics
 {
@@ -198,7 +196,7 @@ SystemMetrics calculateMetrics(const std::vector<Body> &bodies)
 Vector2 worldToScreen(Vec2 worldPos, float scale, Vector2 center)
 {
     return Vector2{
-        (worldPos.x - center.x) * scale + GetScreenWidth() / 2.0f, 
+        (worldPos.x - center.x) * scale + GetScreenWidth() / 2.0f,
         (worldPos.y - center.y) * scale + GetScreenHeight() / 2.0f};
 }
 
@@ -210,8 +208,8 @@ bool isInScreenBounds(const Vec2 &worldPos, float scale, Vector2 center, float m
     float width = GetScreenWidth() + scaledMargin;
     float height = GetScreenHeight() + scaledMargin;
 
-    return screenPos.x >= -scaledMargin && screenPos.x <= width && 
-           screenPos.y >= -scaledMargin && screenPos.y <= height; 
+    return screenPos.x >= -scaledMargin && screenPos.x <= width &&
+           screenPos.y >= -scaledMargin && screenPos.y <= height;
 }
 
 struct RenderStats
@@ -225,15 +223,13 @@ struct RenderStats
     float smoothedPerformanceRatio = 1.0f;
 } renderStats;
 
-
-
 struct Connection
 {
     Vector2 pos1;
     Vector2 pos2;
     unsigned char alpha;
 };
-
+// granular connection mode to the clustered cell mode
 void drawConnections(const std::vector<Body> &bodies, float scale, Vector2 center)
 {
     if (!SHOW_CONNECTIONS)
@@ -242,80 +238,138 @@ void drawConnections(const std::vector<Body> &bodies, float scale, Vector2 cente
     float frameStart = GetTime();
     spatialGrid.clear();
 
-    std::vector<const Body *> visibleBodies;
-    visibleBodies.reserve(bodies.size());
+    // inverse relationship - fewer connections when zoomed out*
+    float zoomFactor = std::max(0.1f, scale);
+    int gridLevel = std::max(0, static_cast<int>(-std::log2(zoomFactor))); // more levels when zoomed out
+    float baseDistance = MAX_DISTANCE;
+    float adaptiveDistance = baseDistance * (1.0f / zoomFactor); // increases with zoom out
+    float adaptiveDistanceSq = adaptiveDistance * adaptiveDistance;
 
+    // Connection count decreases with zoom out
+    int adaptiveMaxConnections = static_cast<int>(MAX_CONNECTIONS * (1.0f / zoomFactor));
+
+    // Keep alpha more visible
+    float baseAlpha = 255.0f;
+    float adaptiveAlpha = std::max(50.0f, baseAlpha * zoomFactor); // Minimum alpha of 50
+
+    // Populate spatial grid without culling
     for (const auto &body : bodies)
     {
-        if (isInScreenBounds(body.pos, scale, center))
+        uint64_t key = getGridKey(body.pos);
+        auto &cell = spatialGrid[key];
+        if (cell.count < MAX_BODIES_PER_CELL)
         {
-            visibleBodies.push_back(&body);
-            uint64_t key = getGridKey(body.pos);
-            auto &cell = spatialGrid[key];
-            if (cell.count < MAX_BODIES_PER_CELL)
-            {
-                cell.bodies[cell.count++] = &body;
-            }
+            cell.bodies[cell.count++] = &body;
         }
     }
 
-    if (visibleBodies.empty())
-        return;
-
-    float visibleRatio = static_cast<float>(visibleBodies.size()) / bodies.size();
-    renderStats.smoothedVisibleRatio = renderStats.smoothedVisibleRatio * 0.95f + visibleRatio * 0.05f;
-
-    float performanceRatio = std::max(0.1f, std::min(2.0f,
-                                                     renderStats.targetFrameTime / (renderStats.lastFrameTime + 0.0001f)));
-    renderStats.smoothedPerformanceRatio = renderStats.smoothedPerformanceRatio * 0.95f +
-                                           performanceRatio * 0.05f;
-
-    int adaptiveMaxConnections = static_cast<int>(MAX_CONNECTIONS *
-                                                  renderStats.smoothedPerformanceRatio *
-                                                  (1.0f - renderStats.smoothedVisibleRatio * 0.5f));
-    adaptiveMaxConnections = std::max(5, std::min(MAX_CONNECTIONS, adaptiveMaxConnections));
-
-    float adaptiveAlpha = 55.0f * renderStats.smoothedPerformanceRatio;
-    float adaptiveDistance = MAX_DISTANCE * (0.5f + renderStats.smoothedPerformanceRatio * 0.5f);
-    float adaptiveDistanceSq = adaptiveDistance * adaptiveDistance;
-
-    std::vector<Connection> connections;
+    // Batch render connections
+    rlBegin(RL_LINES);
+    int totalConnections = 0;
 
     for (const auto &[key, cell] : spatialGrid)
     {
-        for (int i = 0; i < cell.count; i++)
+        if (cell.count == 0)
+            continue;
+        if (gridLevel > 2 && cell.count > 1)
         {
-            const Body *body1 = cell.bodies[i];
-            int connectionsCount = 0;
+            //     // Draw one connection per cell to represent the group
+            //     Vec2 cellCenter = Vec2::zero();
+            //     for (int i = 0; i < cell.count; i++)
+            //     {
+            //         cellCenter = cellCenter + cell.bodies[i]->pos;
+            //     }
+            //     cellCenter = cellCenter * (1.0f / cell.count);
 
-            for (int dx = -1; dx <= 1; dx++)
+            //     Vector2 screenPos = worldToScreen(cellCenter, scale, center);
+
+            //     // Draw connections to neighboring cells only
+            //     for (int dx = -1; dx <= 1; dx++)
+            //     {
+            //         for (int dy = -1; dy <= 1; dy++)
+            //         {
+            //             if (dx == 0 && dy == 0)
+            //                 continue;
+
+            //             uint64_t nKey = getGridKey(Vec2{
+            //                 cellCenter.x + dx * baseDistance,
+            //                 cellCenter.y + dy * baseDistance});
+
+            //             const auto &nCellIt = spatialGrid.find(nKey);
+            //             if (nCellIt != spatialGrid.end() && nCellIt->second.count > 0)
+            //             {
+            //                 Vec2 nCellCenter = Vec2::zero();
+            //                 for (int i = 0; i < nCellIt->second.count; i++)
+            //                 {
+            //                     nCellCenter = nCellCenter + nCellIt->second.bodies[i]->pos;
+            //                 }
+            //                 nCellCenter = nCellCenter * (1.0f / nCellIt->second.count);
+
+            //                 Vector2 nScreenPos = worldToScreen(nCellCenter, scale, center);
+
+            //                 Color lineColor = {255, 190, 152, (unsigned char)adaptiveAlpha};
+            //                 rlColor4ub(lineColor.r, lineColor.g, lineColor.b, lineColor.a);
+            //                 rlVertex2f(screenPos.x, screenPos.y);
+            //                 rlVertex2f(nScreenPos.x, nScreenPos.y);
+
+            //                 totalConnections++;
+            //             }
+            //         }
+            //     }
+            // }
+            // else
+            // {
+
+            for (int i = 0; i < cell.count; i++)
             {
-                for (int dy = -1; dy <= 1; dy++)
+                const Body *body1 = cell.bodies[i];
+                int connectionsCount = 0;
+
+                // Removed size culling for source body
+                Vector2 pos1 = worldToScreen(body1->pos, scale, center);
+
+                // Relaxed screen bounds check
+                if (!isInScreenBounds(body1->pos, scale, center, MAX_DISTANCE))
+                    continue;
+
+                for (int dx = -1; dx <= 1 && connectionsCount < adaptiveMaxConnections; dx++)
                 {
-                    uint64_t nKey = getGridKey(Vec2{
-                        body1->pos.x + dx * adaptiveDistance,
-                        body1->pos.y + dy * adaptiveDistance});
-
-                    const auto &nCellIt = spatialGrid.find(nKey);
-                    if (nCellIt != spatialGrid.end())
+                    for (int dy = -1; dy <= 1 && connectionsCount < adaptiveMaxConnections; dy++)
                     {
-                        const auto &nCell = nCellIt->second;
-                        for (int j = 0; j < nCell.count && connectionsCount < adaptiveMaxConnections; j++)
-                        {
-                            const Body *body2 = nCell.bodies[j];
-                            if (body1 != body2)
-                            {
-                                float distSq = (body1->pos - body2->pos).mag_sq();
-                                if (distSq < adaptiveDistanceSq)
-                                {
-                                    Vector2 pos1 = worldToScreen(body1->pos, scale, center);
-                                    Vector2 pos2 = worldToScreen(body2->pos, scale, center);
-                                    float alpha = std::max(0.0f, 1.0f - (std::sqrt(distSq) / adaptiveDistance));
+                        uint64_t nKey = getGridKey(Vec2{
+                            body1->pos.x + dx * adaptiveDistance,
+                            body1->pos.y + dy * adaptiveDistance});
 
-                                    connections.push_back({pos1,
-                                                           pos2,
-                                                           (unsigned char)(alpha * adaptiveAlpha)});
-                                    connectionsCount++;
+                        const auto &nCellIt = spatialGrid.find(nKey);
+                        if (nCellIt != spatialGrid.end())
+                        {
+                            const auto &nCell = nCellIt->second;
+                            for (int j = 0; j < nCell.count && connectionsCount < adaptiveMaxConnections; j++)
+                            {
+                                const Body *body2 = nCell.bodies[j];
+                                if (body1 != body2)
+                                {
+                                    // Removed size culling for target body
+                                    float distSq = (body1->pos - body2->pos).mag_sq();
+                                    if (distSq < adaptiveDistanceSq)
+                                    {
+                                        Vector2 pos2 = worldToScreen(body2->pos, scale, center);
+
+                                        // Only check if target is in view
+                                        if (!isInScreenBounds(body2->pos, scale, center, MAX_DISTANCE))
+                                            continue;
+
+                                        float alpha = std::max(0.0f, 1.0f - (std::sqrt(distSq) / adaptiveDistance));
+                                        // Color lineColor = {255, 255, 255, (unsigned char)(alpha * adaptiveAlpha)};
+                                        Color lineColor = {255, 0, 0, (unsigned char)(alpha * adaptiveAlpha)};
+
+                                        rlColor4ub(lineColor.r, lineColor.g, lineColor.b, lineColor.a);
+                                        rlVertex2f(pos1.x, pos1.y);
+                                        rlVertex2f(pos2.x, pos2.y);
+
+                                        connectionsCount++;
+                                        totalConnections++;
+                                    }
                                 }
                             }
                         }
@@ -325,111 +379,101 @@ void drawConnections(const std::vector<Body> &bodies, float scale, Vector2 cente
         }
     }
 
-    for (const auto &conn : connections)
-    {
-        DrawLineEx(conn.pos1, conn.pos2, 1.0f,
-                   (Color){255, 255, 255, conn.alpha});
-    }
+    rlEnd();
 
     renderStats.lastFrameTime = static_cast<float>(GetTime()) - frameStart;
-    renderStats.totalVisibleBodies = visibleBodies.size();
-    renderStats.totalConnections = connections.size();
+    renderStats.totalConnections = totalConnections;
 }
-//currently broken
-// void drawQuadtreeNode(const Node &node, const std::vector<Node> &nodes,
-//                       float scale, Vector2 center, RenderTexture2D &circleTexture)
-// {
-//     if (PERFORMANCE_MODE && GetFPS() < 30)
-//         return;
-
-//     // Node pool for traversal
-//     static std::vector<const Node *> nodePool;
-//     nodePool.clear();
-//     nodePool.reserve(nodes.size()); // Reserve more space
-//     nodePool.push_back(&node);
-
-//     // Collection for visible nodes only
-//     static std::vector<Rectangle> visibleQuads;
-//     static std::vector<Vector2> visiblePoints;
-//     visibleQuads.clear();
-//     visiblePoints.clear();
-
-//     while (!nodePool.empty())
-//     {
-//         const Node *current = nodePool.back();
-//         nodePool.pop_back();
-
-//         // First check if node is visible
-//         // if (isInScreenBounds(current->data.quad.center, scale, center))
-//         // {
-//             Vector2 screenPos = worldToScreen(current->data.quad.center, scale, center);
-//             float size = current->data.quad.size * scale;
-
-//             // Add to visible quads
-//             visibleQuads.push_back(Rectangle{ //accounts for 35.3% performance loss
-//                 screenPos.x - size / 2,
-//                 screenPos.y - size / 2,
-//                 size,
-//                 size});
-
-//             // Add point if leaf node CRITICAL BOTTLENECK
-//             if (!current->is_branch())
-//             {
-//                 visiblePoints.push_back(worldToScreen(current->data.pos, scale, center));
-//             }
-//         // }
-
-//         if (current->is_branch())
-//         {
-//             for (int i = 0; i < 4; i++)
-//             {
-//                 if (current->children + i < nodes.size())
-//                 {
-//                     nodePool.push_back(&nodes[current->children + i]); 
-//                 }
-//             }
-//         }
-//     }
-
-//     for (const auto &quad : visibleQuads)
-//     {
-//         DrawRectangleLinesEx(quad, 1, {100, 100, 100, 100});
-//     }
-
-  
-
-//     for (const auto &point : visiblePoints)
-//     {
-//         // Use DrawTexturePro with same sizing as in main loop
-//         DrawTexturePro(
-//             circleTexture.texture,
-//             (Rectangle){0, 0, (float)circleTexture.texture.width, (float)circleTexture.texture.height},
-//             (Rectangle){point.x - 2.0f, point.y - 2.0f, 4.0f, 4.0f},
-//             (Vector2){2.0f, 2.0f},
-//             0.0f,
-//             RED);
-//     }
-// }
-void drawQuadtreeNode(const Node &node, const std::vector<Node> &nodes, float scale, Vector2 center)
+struct QuadtreeRenderStats
 {
-    Vector2 pos = worldToScreen(node.data.pos, scale, center);
-    DrawCircleV(pos, 2.0f, RED);
-    float size = node.data.quad.size * scale;
-    Vector2 quadPos = worldToScreen(node.data.quad.center, scale, center);
+    float lastFrameTime = 0.0f;
+    float smoothedPerformanceRatio = 1.0f;
+} quadtreeStats;
 
-    DrawRectangleLinesEx(
-        {quadPos.x - size / 2, quadPos.y - size / 2, size, size},
-        1,
-        {100, 100, 100, 100});
 
-    if (node.is_branch())
+void drawQuadtreeNode(const Node &root, const std::vector<Node> &nodes, float scale, Vector2 center)
+{
+    if (!SHOW_QUADTREE)
+        return;
+
+    float frameStart = GetTime();
+
+    // Pre-allocate vectors
+    static std::vector<Rectangle> visibleQuads;
+    static std::vector<Vector2> visiblePoints;
+    static std::vector<const Node *> nodeStack;
+
+    visibleQuads.clear();
+    visiblePoints.clear();
+    nodeStack.clear();
+
+    visibleQuads.reserve(nodes.size());
+    visiblePoints.reserve(nodes.size());
+    nodeStack.reserve(nodes.size());
+
+    nodeStack.push_back(&root);
+
+    // Remove performance-based returns and adaptive calculations
+    // Just collect visible nodes
+    while (!nodeStack.empty())
     {
-        for (size_t i = 0; i < 4; ++i)
+        const Node *current = nodeStack.back();
+        nodeStack.pop_back();
+
+        if (isInScreenBounds(current->data.quad.center, scale, center))
         {
-            drawQuadtreeNode(nodes[node.children + i], nodes, scale, center);
+            Vector2 screenPos = worldToScreen(current->data.quad.center, scale, center);
+            float size = current->data.quad.size * scale;
+
+            if (size >= 1.0f)
+            { // Only add if visible
+                visibleQuads.push_back({screenPos.x - size / 2,
+                                        screenPos.y - size / 2,
+                                        size,
+                                        size});
+
+                if (!current->is_branch())
+                {
+                    visiblePoints.push_back(screenPos);
+                }
+            }
+        }
+
+        if (current->is_branch())
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                if (current->children + i < nodes.size())
+                {
+                    nodeStack.push_back(&nodes[current->children + i]);
+                }
+            }
         }
     }
+
+    // Batch render quads
+    rlBegin(RL_LINES);
+    for (const auto &quad : visibleQuads)
+    {
+        Color quadColor = PERFORMANCE_MODE ? (Color){100, 100, 100, 50} : // Dimmer in performance mode
+                              (Color){100, 100, 100, 100};                // Normal otherwise
+
+        rlColor4ub(quadColor.r, quadColor.g, quadColor.b, quadColor.a);
+
+        rlVertex2f(quad.x, quad.y);
+        rlVertex2f(quad.x + quad.width, quad.y);
+        rlVertex2f(quad.x + quad.width, quad.y);
+        rlVertex2f(quad.x + quad.width, quad.y + quad.height);
+        rlVertex2f(quad.x + quad.width, quad.y + quad.height);
+        rlVertex2f(quad.x, quad.y + quad.height);
+        rlVertex2f(quad.x, quad.y + quad.height);
+        rlVertex2f(quad.x, quad.y);
+    }
+    rlEnd();
+
+    quadtreeStats.lastFrameTime = static_cast<float>(GetTime()) - frameStart;
 }
+
 void drawBlackHole(const Body &body, float scale, Vector2 center)
 {
     Vector2 screenPos = worldToScreen(body.pos, scale, center);
@@ -582,7 +626,6 @@ void simulation_thread(std::shared_ptr<Simulation> simulation)
             SHARED_QUADTREE = simulation->quadtree.nodes;
         }
 
-
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         // std::unique_lock<std::mutex> lock(simulationMutex);
         // frameCondition.wait(lock, []
@@ -599,7 +642,6 @@ int main()
     // Vector2 center = {WIDTH / 2.0f, HEIGHT / 2.0f};
     float scale = 1.0f;
     Vector2 center = {0, 0};
-    bool showQuadtree = false;
 
     InitWindow(WIDTH, HEIGHT, "N-Body Simulation");
     GuiLoadStyleDefault();
@@ -635,7 +677,7 @@ int main()
         }
         if (IsKeyPressed(KEY_Q))
         {
-            showQuadtree = !showQuadtree;
+            SHOW_QUADTREE = !SHOW_QUADTREE;
         }
         if (IsKeyPressed(KEY_C))
         {
@@ -689,21 +731,18 @@ int main()
         {
             if (SHOW_CONNECTIONS)
             {
-                drawConnections(SHARED_BODIES, scale, center);
+                drawConnections(SHARED_BODIES, scale, center); // massive bottleneck performance lost is perporttotal to how long the simulation has been running
             }
 
+            if (SHOW_QUADTREE && !SHARED_QUADTREE.empty())
+            {
+                drawQuadtreeNode(SHARED_QUADTREE[0], SHARED_QUADTREE, scale, center);
+            }
             std::lock_guard<std::mutex> lock(UPDATE_LOCK);
             if (SHOW_BODIES)
             {
-                if (showQuadtree)
-                {
-                    if (!SHARED_QUADTREE.empty())
-                    {
-                        drawQuadtreeNode(SHARED_QUADTREE[0], SHARED_QUADTREE, scale, center);
-                    }
-                }
 
-                else if  (PERFORMANCE_MODE)
+                if (PERFORMANCE_MODE)
                 {
                     const Body *centralMass = nullptr;
                     float maxRadius = 0;
@@ -719,7 +758,7 @@ int main()
                             centralMass = &body;
                         }
 
-                        if (isInScreenBounds(body.pos, scale, center)) 
+                        if (isInScreenBounds(body.pos, scale, center))
                         {
                             visibleBodies.push_back(&body);
                         }
@@ -751,10 +790,6 @@ int main()
                 }
                 else
                 {
-                    if (showQuadtree && !SHARED_QUADTREE.empty())
-                    {
-                        drawQuadtreeNode(SHARED_QUADTREE[0], SHARED_QUADTREE, scale, center);
-                    }
 
                     const Body *centralMass = nullptr;
                     float maxRadius = 0;
@@ -770,7 +805,7 @@ int main()
 
                     for (const auto &body : SHARED_BODIES)
                     {
-                    
+
                         if (!isInScreenBounds(body.pos, scale, center))
                         {
                             continue;
@@ -786,7 +821,7 @@ int main()
 
                         // Render the body
                         // DrawCircleV(screenPos, screenRadius, getStarColorWithBrightness(body, 3.0f)); ->massive bottleneck
-                        DrawTexturePro( 
+                        DrawTexturePro(
                             circleTexture.texture,
                             (Rectangle){0, 0, (float)circleTexture.texture.width, (float)circleTexture.texture.height},
                             (Rectangle){screenPos.x - screenRadius, screenPos.y - screenRadius, screenRadius * 2, screenRadius * 2},
@@ -854,7 +889,7 @@ int main()
         if (GuiSliderBar(sliderBounds, "dt", TextFormat("%.3f", (double)currentDt),
                          &sliderDt, SLIDER_MIN_DT, SLIDER_MAX_DT))
         {
-            SIMULATION_DT.store(sliderDt); 
+            SIMULATION_DT.store(sliderDt);
         }
 
         GuiSetStyle(SLIDER, BASE_COLOR_NORMAL, ColorToInt(originalBaseColor));
@@ -909,7 +944,7 @@ int main()
                 DrawText(TextFormat("Net Force: %.2e", (double)metrics.netForce), rightX, y, 5, WHITE);
             }
         }
-        EndDrawing(); 
+        EndDrawing();
         // {
         //     std::lock_guard<std::mutex> lock(simulationMutex);
         //     frameRendered = true;

@@ -15,7 +15,6 @@
 
 extern std::atomic<float> SIMULATION_DT;
 
-
 struct SpatialGrid
 {
     static constexpr float CELL_SIZE = 600.0f;
@@ -34,7 +33,6 @@ struct SpatialGrid
         return ((x * 92837111) ^ (y * 689287499)) * 15485863;
     }
 };
-
 
 struct SweepEntry
 {
@@ -60,7 +58,7 @@ public:
     Simulation()
         : frame(0), quadtree(1.0f, 1.0f, 16)
     {
-        size_t n = 100000;
+        size_t n = 25000;
         bodies.reserve(n);
         bodyIndices.reserve(n);
         bodies = uniform_disc(n);
@@ -72,23 +70,98 @@ public:
         iterate(current_dt);
         //  Body::batch_update_parallel(bodies, current_dt);
         collide();
-        attract();
+        // attract();
         ++frame;
-
-        
     }
 
 private:
-    void iterate(float dt)
-    {
+//     void iterate(float dt)
+//     {
+//         // Single force evaluation
+//         attract();
 
-        for (auto &body : bodies)
-        {
-            body.update(dt);
+//         // Pre-declare vector size
+//         const size_t n = bodies.size();
+
+//         // Ensure data alignment
+//         alignas(32) std::vector<Vec2> velocities(n);
+//         alignas(32) std::vector<Vec2> positions(n);
+
+// // Update velocities with improved vectorization hints
+// #if defined(__clang__)
+// #pragma clang loop vectorize(enable) interleave(enable) unroll(enable)
+// #pragma clang loop vectorize_width(4) interleave_count(4)
+// #endif
+//         for (size_t i = 0; i < n; ++i)
+//         {
+//             // Separate velocity update into x and y components
+//             bodies[i].vel.x += bodies[i].acc.x * dt;
+//             bodies[i].vel.y += bodies[i].acc.y * dt;
+//         }
+
+// // Update positions with improved vectorization hints
+// #if defined(__clang__)
+// #pragma clang loop vectorize(enable) interleave(enable) unroll(enable)
+// #pragma clang loop vectorize_width(4) interleave_count(4)
+// #endif
+//         for (size_t i = 0; i < n; ++i)
+//         {
+//             // Separate position update into x and y components
+//             bodies[i].pos.x += bodies[i].vel.x * dt;
+//             bodies[i].pos.y += bodies[i].vel.y * dt;
+//         }
+//     }
+
+//unstable but fun
+void iterate(float dt) {
+    attract();
+    
+    const size_t n = bodies.size();
+    const float BOUNDARY_RADIUS = 100000.0f;
+    const float SOFT_BOUNDARY = BOUNDARY_RADIUS * 0.8f;
+    const float BOUNDARY_FORCE = 0.9f;
+    const float DAMPING = 0.9995f;
+    const float MAX_VELOCITY = 1000.0f;
+    
+    #if defined(__clang__)
+    #pragma clang loop vectorize(enable) interleave(enable)
+    #endif
+    for (size_t i = 0; i < n; ++i) {
+        bodies[i].vel.x += bodies[i].acc.x * dt;
+        bodies[i].vel.y += bodies[i].acc.y * dt;
+        
+        float velMagSq = bodies[i].vel.mag_sq();
+        if (velMagSq > MAX_VELOCITY * MAX_VELOCITY) {
+            float scale = MAX_VELOCITY / std::sqrt(velMagSq);
+            bodies[i].vel *= scale;
         }
     }
 
-   
+    const float SOFT_BOUNDARY_SQ = SOFT_BOUNDARY * SOFT_BOUNDARY;
+    
+    for (size_t i = 0; i < n; ++i) {
+        float distSq = bodies[i].pos.mag_sq();
+        
+        if (distSq > SOFT_BOUNDARY_SQ) {
+            float dist = std::sqrt(distSq);
+            float ratio = dist / SOFT_BOUNDARY;
+            float force = BOUNDARY_FORCE * std::exp(ratio - 1.0f);
+            
+            Vec2 dir = bodies[i].pos * (-1.0f / dist); // Normalized inward direction
+            Vec2 boundaryForce = dir * (force * dt);
+            bodies[i].vel += boundaryForce;
+            bodies[i].vel *= DAMPING;
+        }
+    }
+
+    #if defined(__clang__)
+    #pragma clang loop vectorize(enable) interleave(enable)
+    #endif
+    for (size_t i = 0; i < n; ++i) {
+        bodies[i].pos.x += bodies[i].vel.x * dt;
+        bodies[i].pos.y += bodies[i].vel.y * dt;
+    }
+}
     // significant bottleneck
     //  void attract()
     //  {
@@ -104,20 +177,33 @@ private:
     {
         quadtree.build(bodies);
 
-        const unsigned int num_threads = std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4;
-        std::vector<std::future<void>> futures;
+        const unsigned int max_hardware_threads = std::thread::hardware_concurrency();
 
-        size_t chunk_size = bodies.size() / num_threads;
+        static constexpr unsigned int MIN_THREADS = 8;
+        static constexpr unsigned int BODIES_PER_THREAD = 5000;
+
+        const unsigned int threads_by_bodies = static_cast<unsigned int>(bodies.size() / BODIES_PER_THREAD) + 1;
+        const unsigned int num_threads = std::clamp(
+            threads_by_bodies,
+            MIN_THREADS,
+            std::min(max_hardware_threads, static_cast<unsigned int>(bodies.size() / 4)));
+        const size_t chunk_size = (bodies.size() + num_threads - 1) / num_threads;
+
+        std::vector<std::future<void>> futures;
+        futures.reserve(num_threads); 
 
         for (unsigned int t = 0; t < num_threads; ++t)
         {
             size_t start = t * chunk_size;
-            size_t end = (t == num_threads - 1) ? bodies.size() : start + chunk_size;
+            size_t end = std::min(start + chunk_size, bodies.size());
+
+            if (start >= end)
+                break;
 
             futures.emplace_back(std::async(std::launch::async, [&, start, end]()
                                             {
             for (size_t i = start; i < end; ++i) {
-                bodies[i].acc = quadtree.acc(bodies[i].pos, bodies); 
+                bodies[i].acc = quadtree.acc(bodies[i].pos, bodies);
             } }));
         }
 
@@ -198,13 +284,11 @@ private:
             }
         }
 
-
         for (const auto &[i, j] : broadPhasePairs)
         {
             resolve(i, j);
         }
     }
- 
 
     void resolve(size_t i, size_t j)
     {
@@ -276,7 +360,7 @@ private:
 
         // const float TAU = 6.28318530718f; // Tau constant
         // const float TAU = (std::atan(1)*4)*2.0f;
-        // constexpr double TAU = std::numbers::pi * 4;
+        // constexpr double TAU = std::numbers::pi * 2;
 
         // mass ranges and their probabilities here
         struct MassRange
@@ -447,7 +531,7 @@ private:
             y += dy * dt;
             z += dz * dt;
 
-            float scale = outer_radius / 10.0f; 
+            float scale = outer_radius / 10.0f;
             Vec2 pos(x * scale, y * scale);
 
             Vec2 vel(-pos.y, pos.x);
@@ -492,7 +576,7 @@ private:
 
             float mass = dist(rng) * (selectedRange.max_mass - selectedRange.min_mass) + selectedRange.min_mass;
 
-            float radius = std::cbrt(mass); 
+            float radius = std::cbrt(mass);
 
             bodies.push_back(Body(pos, vel, mass, radius));
         }
